@@ -1,0 +1,45 @@
+
+name: LAB9 - Pipeline CI/CD
+
+on:
+  push:
+    branches: [develop, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Verificar API
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Baixar codigo
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install httpx
+
+      - name: Testar API
+        run: |
+          python - <<'PY'
+          from fastapi.testclient import TestClient
+          from main import app
+
+          client = TestClient(app)
+
+          response = client.get("/health")
+          assert response.status_code == 200
+          assert response.json()["status"] == "ok"
+
+          print("API funcionando corretamente!")
+          PY
