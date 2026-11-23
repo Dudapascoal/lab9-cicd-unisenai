@@ -17,6 +17,7 @@ env:
   IMAGE_NAME: lab9-fastapi
   AWS_REGION: us-east-1
   EC2_INSTANCE_ID: i-03957d570b8193030
+  EC2_INSTANCE_ID_PRODUCAO: i-0fa27c50213a91647
 
 jobs:
   build:
@@ -154,4 +155,91 @@ jobs:
       - name: Confirmar homologacao
         run: |
           echo "Deploy de homologacao concluido!"
+          echo "Commit: $GITHUB_SHA"
+
+  deploy_producao:
+    name: Deploy Producao
+    runs-on: ubuntu-latest
+    needs: docker_build
+
+    if: github.ref == 'refs/heads/main'
+
+    environment:
+      name: producao
+
+    steps:
+      - name: Configurar credenciais AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Enviar deploy para EC2 de producao
+        env:
+          DEPLOY_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          cat > ssm-producao.json <<'JSON'
+          {
+            "commands": [
+              "set -e",
+              "cd /home/ubuntu/lab9-cicd-unisenai",
+              "git config --global --add safe.directory /home/ubuntu/lab9-cicd-unisenai",
+              "git fetch origin main",
+              "git checkout main",
+              "git reset --hard DEPLOY_COMMIT",
+              "docker build -t lab9-fastapi:DEPLOY_COMMIT .",
+              "docker rm -f lab9-producao || true",
+              "docker run -d --name lab9-producao --restart unless-stopped -p 8080:8080 lab9-fastapi:DEPLOY_COMMIT",
+              "for i in $(seq 1 15); do if curl -fsS http://127.0.0.1:8080/health; then echo 'API de producao funcionando!'; exit 0; fi; sleep 2; done; echo 'Falha no health check'; exit 1"
+            ]
+          }
+          JSON
+
+          sed -i "s/DEPLOY_COMMIT/${DEPLOY_SHA}/g" ssm-producao.json
+
+          COMMAND_ID=$(aws ssm send-command \
+            --region "$AWS_REGION" \
+            --instance-ids "$EC2_INSTANCE_ID_PRODUCAO" \
+            --document-name "AWS-RunShellScript" \
+            --parameters file://ssm-producao.json \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "Comando enviado: $COMMAND_ID"
+
+          if aws ssm wait command-executed \
+            --region "$AWS_REGION" \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$EC2_INSTANCE_ID_PRODUCAO"; then
+            echo "Comando SSM finalizado."
+          else
+            echo "O comando SSM nao terminou com sucesso."
+          fi
+
+          aws ssm get-command-invocation \
+            --region "$AWS_REGION" \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$EC2_INSTANCE_ID_PRODUCAO" \
+            --query "{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}" \
+            --output json
+
+          STATUS=$(aws ssm get-command-invocation \
+            --region "$AWS_REGION" \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$EC2_INSTANCE_ID_PRODUCAO" \
+            --query "Status" \
+            --output text)
+
+          if [ "$STATUS" != "Success" ]; then
+            echo "Erro: deploy de producao falhou."
+            exit 1
+          fi
+
+      - name: Confirmar producao
+        run: |
+          echo "Deploy de producao concluido!"
           echo "Commit: $GITHUB_SHA"
