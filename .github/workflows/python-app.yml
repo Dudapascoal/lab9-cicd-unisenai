@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: lab9-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   IMAGE_NAME: lab9-fastapi
 
@@ -61,14 +65,12 @@ jobs:
 
       - name: Construir imagem Docker
         run: |
-          docker build -t ${{ env.IMAGE_NAME }}:latest .
+          docker build -t "${IMAGE_NAME}:${GITHUB_SHA}" .
 
       - name: Verificar imagem criada
         run: |
-          docker image inspect ${{ env.IMAGE_NAME }}:latest
+          docker image inspect "${IMAGE_NAME}:${GITHUB_SHA}"
 
-
-          
   deploy_homologacao:
     name: Deploy Homologacao
     runs-on: ubuntu-latest
@@ -80,13 +82,69 @@ jobs:
       name: homologacao
 
     steps:
-      - name: Preparar homologacao
+      - name: Configurar acesso SSH
+        env:
+          SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
         run: |
-          echo "Iniciando etapa de homologacao"
-          echo "Branch: develop"
-          echo "Porta prevista: 8080"
+          set -eu
+          test -n "$SSH_KEY"
+          test -n "$SSH_KNOWN_HOSTS"
 
-      - name: Confirmar etapa
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Publicar API na EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USERNAME: ${{ secrets.EC2_USERNAME }}
         run: |
-          echo "Etapa de homologacao executada!"
+          set -eu
 
+          ssh \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=15 \
+            -i ~/.ssh/id_deploy \
+            "$EC2_USERNAME@$EC2_HOST" \
+            "DEPLOY_SHA='$GITHUB_SHA' bash -se" <<'REMOTE'
+          set -euo pipefail
+
+          cd /home/ubuntu/lab9-cicd-unisenai
+
+          git fetch origin develop
+          git checkout develop
+          git reset --hard "$DEPLOY_SHA"
+
+          sudo docker build -t "lab9-fastapi:$DEPLOY_SHA" .
+
+          sudo docker rm -f lab9-fastapi || true
+
+          sudo docker run -d \
+            --name lab9-fastapi \
+            --restart unless-stopped \
+            -p 8080:8080 \
+            "lab9-fastapi:$DEPLOY_SHA"
+
+          for i in $(seq 1 15); do
+            if curl -fsS http://127.0.0.1:8080/health; then
+              echo "API publicada com sucesso!"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "Falha na verificacao de saude da API"
+          exit 1
+          REMOTE
+
+      - name: Confirmar deploy
+        run: |
+          echo "Deploy de homologacao concluido!"
+          echo "Commit: $GITHUB_SHA"
