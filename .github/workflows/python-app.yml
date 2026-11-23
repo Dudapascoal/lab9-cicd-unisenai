@@ -15,6 +15,8 @@ concurrency:
 
 env:
   IMAGE_NAME: lab9-fastapi
+  AWS_REGION: us-east-1
+  EC2_INSTANCE_ID: i-03957d570b8193030
 
 jobs:
   build:
@@ -43,8 +45,8 @@ jobs:
           from main import app
 
           client = TestClient(app)
-
           response = client.get("/health")
+
           assert response.status_code == 200
           assert response.json()["status"] == "ok"
 
@@ -59,9 +61,6 @@ jobs:
     steps:
       - name: Baixar codigo
         uses: actions/checkout@v4
-
-      - name: Configurar Docker Buildx
-        uses: docker/setup-buildx-action@v3
 
       - name: Construir imagem Docker
         run: |
@@ -82,69 +81,61 @@ jobs:
       name: homologacao
 
     steps:
-      - name: Configurar acesso SSH
+      - name: Configurar credenciais AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Enviar deploy para EC2
         env:
-          SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
-          SSH_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+          DEPLOY_SHA: ${{ github.sha }}
         run: |
-          set -eu
-          test -n "$SSH_KEY"
-          test -n "$SSH_KNOWN_HOSTS"
-
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-
-          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_deploy
-          chmod 600 ~/.ssh/id_deploy
-
-          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
-          chmod 600 ~/.ssh/known_hosts
-
-      - name: Publicar API na EC2
-        env:
-          EC2_HOST: ${{ secrets.EC2_HOST }}
-          EC2_USERNAME: ${{ secrets.EC2_USERNAME }}
-        run: |
-          set -eu
-
-          ssh \
-            -o BatchMode=yes \
-            -o StrictHostKeyChecking=yes \
-            -o ConnectTimeout=15 \
-            -i ~/.ssh/id_deploy \
-            "$EC2_USERNAME@$EC2_HOST" \
-            "DEPLOY_SHA='$GITHUB_SHA' bash -se" <<'REMOTE'
           set -euo pipefail
 
-          cd /home/ubuntu/lab9-cicd-unisenai
+          cat > ssm-parameters.json <<'JSON'
+          {
+            "commands": [
+              "set -e",
+              "cd /home/ubuntu/lab9-cicd-unisenai",
+              "git fetch origin develop",
+              "git checkout develop",
+              "git reset --hard DEPLOY_COMMIT",
+              "docker build -t lab9-fastapi:DEPLOY_COMMIT .",
+              "docker rm -f lab9-fastapi || true",
+              "docker run -d --name lab9-fastapi --restart unless-stopped -p 8080:8080 lab9-fastapi:DEPLOY_COMMIT",
+              "for i in $(seq 1 15); do if curl -fsS http://127.0.0.1:8080/health; then exit 0; fi; sleep 2; done; exit 1"
+            ]
+          }
+          JSON
 
-          git fetch origin develop
-          git checkout develop
-          git reset --hard "$DEPLOY_SHA"
+          sed -i "s/DEPLOY_COMMIT/${DEPLOY_SHA}/g" ssm-parameters.json
 
-          sudo docker build -t "lab9-fastapi:$DEPLOY_SHA" .
+          COMMAND_ID=$(aws ssm send-command \
+            --region "$AWS_REGION" \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters file://ssm-parameters.json \
+            --query "Command.CommandId" \
+            --output text)
 
-          sudo docker rm -f lab9-fastapi || true
+          echo "Comando enviado: $COMMAND_ID"
 
-          sudo docker run -d \
-            --name lab9-fastapi \
-            --restart unless-stopped \
-            -p 8080:8080 \
-            "lab9-fastapi:$DEPLOY_SHA"
+          aws ssm wait command-executed \
+            --region "$AWS_REGION" \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$EC2_INSTANCE_ID"
 
-          for i in $(seq 1 15); do
-            if curl -fsS http://127.0.0.1:8080/health; then
-              echo "API publicada com sucesso!"
-              exit 0
-            fi
-            sleep 2
-          done
+          aws ssm get-command-invocation \
+            --region "$AWS_REGION" \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$EC2_INSTANCE_ID" \
+            --query "{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}" \
+            --output json
 
-          echo "Falha na verificacao de saude da API"
-          exit 1
-          REMOTE
-
-      - name: Confirmar deploy
+      - name: Confirmar homologacao
         run: |
           echo "Deploy de homologacao concluido!"
           echo "Commit: $GITHUB_SHA"
